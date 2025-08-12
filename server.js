@@ -12,6 +12,7 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const rooms = new Map();
+const groups = new Map(); // New: For P2M groups
 
 
 // -------------------- MIDDLEWARE --------------------
@@ -50,8 +51,19 @@ app.get('/api/ping', (req, res) => {
     status: 'ok',
     message: 'WebSocket signaling server is running',
     roomsActive: rooms.size,
+    groupsActive: groups.size, // New: Add groups count
     clientsConnected: wss.clients.size,
   });
+});
+
+// New: Group management endpoints
+app.get('/api/groups', (req, res) => {
+  const groupsList = Array.from(groups.keys()).map(groupId => ({
+    groupId,
+    memberCount: groups.get(groupId).members.size,
+    isOpen: groups.get(groupId).isOpen
+  }));
+  res.json({ groups: groupsList });
 });
 
 
@@ -70,7 +82,7 @@ wss.on('connection', (ws) => {
 
     switch (data.type) {
       case 'create-room':
-        const roomId = Math.floor(100000 + Math.random() * 900000).toString();
+        const roomId = generateUniqueRoomId();
         rooms.set(roomId, { host: ws, guest: null });
         ws.send(JSON.stringify({ type: 'room-created', roomId }));
         console.log(`[WS] Room ${roomId} created.`);
@@ -111,20 +123,156 @@ wss.on('connection', (ws) => {
         }
         break;
 
+      // New: Group management cases
+      case 'create-group':
+        const groupId = generateUniqueGroupId();
+        const maxMembers = data.maxMembers || 20;
+        groups.set(groupId, {
+          host: ws,
+          members: new Set([ws]),
+          maxMembers,
+          isOpen: true,
+          createdAt: Date.now()
+        });
+        ws.send(JSON.stringify({ type: 'group-created', groupId, maxMembers }));
+        console.log(`[WS] Group ${groupId} created with max ${maxMembers} members.`);
+        break;
+
+      case 'join-group':
+        const group = groups.get(data.groupId);
+        if (group && group.isOpen && group.members.size < group.maxMembers) {
+          group.members.add(ws);
+          // Notify all members about new join
+          group.members.forEach(member => {
+            if (member !== ws) {
+              member.send(JSON.stringify({ 
+                type: 'member-joined', 
+                groupId: data.groupId,
+                memberCount: group.members.size 
+              }));
+            }
+          });
+          ws.send(JSON.stringify({ 
+            type: 'group-joined', 
+            groupId: data.groupId,
+            memberCount: group.members.size,
+            maxMembers: group.maxMembers
+          }));
+          console.log(`[WS] User joined group ${data.groupId}. Members: ${group.members.size}/${group.maxMembers}`);
+        } else {
+          ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: group ? 'Group is full or closed' : 'Group not found' 
+          }));
+        }
+        break;
+
+      case 'close-group':
+        const groupToClose = groups.get(data.groupId);
+        if (groupToClose && groupToClose.host === ws) {
+          groupToClose.isOpen = false;
+          // Notify all members that group is closed
+          groupToClose.members.forEach(member => {
+            member.send(JSON.stringify({ 
+              type: 'group-closed', 
+              groupId: data.groupId 
+            }));
+          });
+          console.log(`[WS] Group ${data.groupId} closed by host.`);
+        }
+        break;
+
+      case 'share-torrent':
+        const groupToShare = groups.get(data.groupId);
+        if (groupToShare && groupToShare.host === ws) {
+          // Send magnet link to all group members
+          groupToShare.members.forEach(member => {
+            if (member !== ws) {
+              member.send(JSON.stringify({
+                type: 'torrent-shared',
+                groupId: data.groupId,
+                magnetLink: data.magnetLink,
+                fileName: data.fileName,
+                fileSize: data.fileSize,
+                infoHash: data.infoHash
+              }));
+            }
+          });
+          console.log(`[WS] Torrent shared in group ${data.groupId}: ${data.fileName} (${data.infoHash})`);
+        }
+        break;
+
+      case 'group-chat':
+        const groupChat = groups.get(data.groupId);
+        if (groupChat && groupChat.members.has(ws)) {
+          // Relay chat message to all group members
+          groupChat.members.forEach(member => {
+            if (member !== ws) {
+              member.send(JSON.stringify(data));
+            }
+          });
+          console.log('[WS] Group chat message relayed:', data);
+        }
+        break;
+
       default:
         console.warn('[WS] Unknown message type:', data.type);
     }
   });
 
   ws.on('close', () => {
+    // Handle P2P room cleanup
     for (const [roomId, room] of rooms) {
       if (room.host === ws || room.guest === ws) {
         rooms.delete(roomId);
         console.log(`[WS] Room ${roomId} closed due to disconnect.`);
       }
     }
+
+    // New: Handle group member cleanup
+    for (const [groupId, group] of groups) {
+      if (group.members.has(ws)) {
+        group.members.delete(ws);
+        console.log(`[WS] Member left group ${groupId}. Remaining: ${group.members.size}`);
+        
+        // If host left, close the group
+        if (group.host === ws) {
+          group.members.forEach(member => {
+            member.send(JSON.stringify({ 
+              type: 'group-closed', 
+              groupId,
+              reason: 'Host disconnected' 
+            }));
+          });
+          groups.delete(groupId);
+          console.log(`[WS] Group ${groupId} closed due to host disconnect.`);
+        }
+        // If no members left, delete the group
+        else if (group.members.size === 0) {
+          groups.delete(groupId);
+          console.log(`[WS] Group ${groupId} deleted due to no members.`);
+        }
+      }
+    }
   });
 });
+
+function generateUniqueRoomId() {
+  let roomId;
+  do {
+    roomId = Math.floor(100000 + Math.random() * 900000).toString();
+  } while (rooms.has(roomId));
+  return roomId;
+}
+
+// New: Generate unique group ID
+function generateUniqueGroupId() {
+  let groupId;
+  do {
+    groupId = Math.floor(100000 + Math.random() * 900000).toString();
+  } while (groups.has(groupId));
+  return groupId;
+}
 
 
 // -------------------- SERVER START --------------------
